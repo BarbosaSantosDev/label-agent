@@ -238,14 +238,30 @@ func (a *app) startHTTP() (*http.Server, error) {
 
 func (a *app) withCORS(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// Pra seu SaaS conseguir chamar o localhost
-		w.Header().Set("Access-Control-Allow-Origin", "*")
+		origin := r.Header.Get("Origin")
+
+		// ✅ Em produção, o browser costuma exigir refletir a Origin (melhor do que "*")
+		// Se quiser restringir depois, valide aqui se origin é seu domínio.
+		if origin != "" {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Vary", "Origin")
+		} else {
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+		}
+
 		w.Header().Set("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		w.Header().Set("Access-Control-Max-Age", "86400")
+
+		// ✅ IMPORTANTE: Private Network Access (site https -> localhost)
+		// Browser manda no preflight: Access-Control-Request-Private-Network: true
+		w.Header().Set("Access-Control-Allow-Private-Network", "true")
+
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
+
 		next(w, r)
 	}
 }
