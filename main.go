@@ -240,7 +240,7 @@ func (a *app) withCORS(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		origin := r.Header.Get("Origin")
 
-		// Melhor que "*": devolve o origin que chamou (site do seu SaaS)
+		// Devolve o origin exato (melhor pra PNA do que "*")
 		if origin != "" {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
 			w.Header().Set("Vary", "Origin")
@@ -249,19 +249,24 @@ func (a *app) withCORS(next http.HandlerFunc) http.HandlerFunc {
 		}
 
 		w.Header().Set("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 
-		// ✅ Private Network Access (Chrome/Edge)
-		// Se o browser mandar preflight pedindo acesso à rede privada, devolva true.
-		if r.Header.Get("Access-Control-Request-Private-Network") == "true" {
-			w.Header().Set("Access-Control-Allow-Private-Network", "true")
+		// ✅ MUITO IMPORTANTE: ecoar o que o browser pediu no preflight
+		if reqHeaders := r.Header.Get("Access-Control-Request-Headers"); reqHeaders != "" {
+			w.Header().Set("Access-Control-Allow-Headers", reqHeaders)
+			// pra cache de preflight não “misturar” requests diferentes
+			w.Header().Add("Vary", "Access-Control-Request-Headers")
 		} else {
-			// também pode devolver sempre, não atrapalha
-			w.Header().Set("Access-Control-Allow-Private-Network", "true")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 		}
 
-		// Opcional: reduz preflights repetidos
-		w.Header().Set("Access-Control-Max-Age", "86400")
+		// ✅ Private Network Access
+		if strings.EqualFold(r.Header.Get("Access-Control-Request-Private-Network"), "true") {
+			w.Header().Set("Access-Control-Allow-Private-Network", "true")
+			w.Header().Add("Vary", "Access-Control-Request-Private-Network")
+		}
+
+		// Opcional: cache do preflight (10 min)
+		w.Header().Set("Access-Control-Max-Age", "600")
 
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
