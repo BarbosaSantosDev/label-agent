@@ -350,6 +350,7 @@ type docInfo1 struct {
 func printRawZPL(printerName, zpl string) error {
 	p, _ := syscall.UTF16PtrFromString(printerName)
 	var h syscall.Handle
+
 	if r, _, _ := openPrinter.Call(uintptr(unsafe.Pointer(p)), uintptr(unsafe.Pointer(&h)), 0); r == 0 {
 		return errors.New("OpenPrinter failed")
 	}
@@ -359,8 +360,10 @@ func printRawZPL(printerName, zpl string) error {
 	raw, _ := syscall.UTF16PtrFromString("RAW")
 
 	di := docInfo1{doc, nil, raw}
-	if startDoc.Call(uintptr(h), 1, uintptr(unsafe.Pointer(&di))) == 0 {
-		return errors.New("StartDoc failed")
+	r1, _, err := startDoc.Call(uintptr(h), 1, uintptr(unsafe.Pointer(&di)))
+	if r1 == 0 {
+		log.Printf("Erro ao iniciar o documento: %v", err)
+		return err
 	}
 	defer endDoc.Call(uintptr(h))
 
@@ -369,8 +372,16 @@ func printRawZPL(printerName, zpl string) error {
 
 	b := []byte(zpl)
 	var written uint32
-	if writePrinter.Call(uintptr(h), uintptr(unsafe.Pointer(&b[0])), uintptr(len(b)), uintptr(unsafe.Pointer(&written))) == 0 {
-		return errors.New("WritePrinter failed")
+	r2, _, err := writePrinter.Call(
+		uintptr(h),
+		uintptr(unsafe.Pointer(&b[0])),
+		uintptr(len(b)),
+		uintptr(unsafe.Pointer(&written)),
+	)
+	if r2 == 0 {
+		log.Printf("Erro ao escrever na impressora: %v", err)
+		return err
 	}
+
 	return nil
 }
