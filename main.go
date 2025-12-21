@@ -240,8 +240,7 @@ func (a *app) withCORS(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		origin := r.Header.Get("Origin")
 
-		// ✅ Em produção, o browser costuma exigir refletir a Origin (melhor do que "*")
-		// Se quiser restringir depois, valide aqui se origin é seu domínio.
+		// Melhor que "*": devolve o origin que chamou (site do seu SaaS)
 		if origin != "" {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
 			w.Header().Set("Vary", "Origin")
@@ -251,11 +250,18 @@ func (a *app) withCORS(next http.HandlerFunc) http.HandlerFunc {
 
 		w.Header().Set("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
-		w.Header().Set("Access-Control-Max-Age", "86400")
 
-		// ✅ IMPORTANTE: Private Network Access (site https -> localhost)
-		// Browser manda no preflight: Access-Control-Request-Private-Network: true
-		w.Header().Set("Access-Control-Allow-Private-Network", "true")
+		// ✅ Private Network Access (Chrome/Edge)
+		// Se o browser mandar preflight pedindo acesso à rede privada, devolva true.
+		if r.Header.Get("Access-Control-Request-Private-Network") == "true" {
+			w.Header().Set("Access-Control-Allow-Private-Network", "true")
+		} else {
+			// também pode devolver sempre, não atrapalha
+			w.Header().Set("Access-Control-Allow-Private-Network", "true")
+		}
+
+		// Opcional: reduz preflights repetidos
+		w.Header().Set("Access-Control-Max-Age", "86400")
 
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
