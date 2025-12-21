@@ -6,7 +6,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"log"
 	"net"
@@ -14,7 +13,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -30,8 +28,10 @@ Endpoints:
 GET  /health
 GET  /printers
 GET  /config
-POST /config/printer   { "printer_name": "..." }
-POST /print            { "printer_name": "...(optional)", "zpl": "^XA..." }
+POST /config/printer
+POST /printer/connect
+POST /printer/disconnect
+POST /print
 */
 
 const (
@@ -50,10 +50,13 @@ type app struct {
 	logger *log.Logger
 }
 
+/* =========================
+   Windows service bootstrap
+========================= */
+
 func main() {
 	isInt, err := svc.IsWindowsService()
 	if err != nil {
-		// fallback: roda em console
 		runConsole()
 		return
 	}
@@ -68,26 +71,20 @@ func main() {
 func runService() {
 	elog, err := eventlog.Open(serviceName)
 	if err != nil {
-		// sem eventlog, tenta console logger
 		runConsole()
 		return
 	}
 	defer elog.Close()
 
 	a := newApp(elog)
-	elog.Info(1, "LabelAgent starting...")
+	elog.Info(1, "LabelAgent starting")
 
-	err = svc.Run(serviceName, &winService{app: a, elog: elog})
-	if err != nil {
-		elog.Error(1, fmt.Sprintf("svc.Run error: %v", err))
-	}
-	elog.Info(1, "LabelAgent stopped.")
+	_ = svc.Run(serviceName, &winService{app: a, elog: elog})
 }
 
 func runConsole() {
-	// modo debug/console
 	a := newApp(nil)
-	_ = debug.Run(serviceName, &winService{app: a, elog: nil})
+	_ = debug.Run(serviceName, &winService{app: a})
 }
 
 type winService struct {
@@ -95,60 +92,35 @@ type winService struct {
 	elog *eventlog.Log
 }
 
-func (m *winService) Execute(args []string, r <-chan svc.ChangeRequest, changes chan<- svc.Status) (bool, uint32) {
-	const accepted = svc.AcceptStop | svc.AcceptShutdown
-	changes <- svc.Status{State: svc.StartPending}
+func (s *winService) Execute(args []string, r <-chan svc.ChangeRequest, status chan<- svc.Status) (bool, uint32) {
+	status <- svc.Status{State: svc.StartPending}
 
-	srv, err := m.app.startHTTP()
+	server, err := s.app.startHTTP()
 	if err != nil {
-		m.logErr(fmt.Sprintf("startHTTP failed: %v", err))
-		changes <- svc.Status{State: svc.Stopped}
+		status <- svc.Status{State: svc.Stopped}
 		return false, 1
 	}
 
-	changes <- svc.Status{State: svc.Running, Accepts: accepted}
-	m.logInfo("HTTP server running on " + listenAddr)
+	status <- svc.Status{State: svc.Running, Accepts: svc.AcceptStop | svc.AcceptShutdown}
 
-	for {
-		select {
-		case c := <-r:
-			switch c.Cmd {
-			case svc.Interrogate:
-				changes <- c.CurrentStatus
-			case svc.Stop, svc.Shutdown:
-				m.logInfo("Stopping service...")
-				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				_ = srv.Shutdown(ctx)
-				cancel()
-				changes <- svc.Status{State: svc.StopPending}
-				changes <- svc.Status{State: svc.Stopped}
-				return false, 0
-			default:
-				// ignore
-			}
+	for c := range r {
+		if c.Cmd == svc.Stop || c.Cmd == svc.Shutdown {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_ = server.Shutdown(ctx)
+			cancel()
+			status <- svc.Status{State: svc.Stopped}
+			return false, 0
 		}
 	}
+	return false, 0
 }
 
-func (m *winService) logInfo(msg string) {
-	if m.elog != nil {
-		_ = m.elog.Info(1, msg)
-	} else {
-		m.app.logger.Println("[INFO]", msg)
-	}
-}
-
-func (m *winService) logErr(msg string) {
-	if m.elog != nil {
-		_ = m.elog.Error(1, msg)
-	} else {
-		m.app.logger.Println("[ERROR]", msg)
-	}
-}
+/* =========================
+   App / Config
+========================= */
 
 func newApp(elog *eventlog.Log) *app {
 	cfgDir := defaultConfigDir()
-
 	_ = os.MkdirAll(cfgDir, 0755)
 
 	logFile := filepath.Join(cfgDir, "label-agent.log")
@@ -161,7 +133,7 @@ func newApp(elog *eventlog.Log) *app {
 
 	a := &app{
 		cfgDir: cfgDir,
-		logger: log.New(out, "label-agent: ", log.LstdFlags|log.Lmicroseconds),
+		logger: log.New(out, "label-agent: ", log.LstdFlags),
 	}
 
 	_ = a.loadConfig()
@@ -169,12 +141,11 @@ func newApp(elog *eventlog.Log) *app {
 }
 
 func defaultConfigDir() string {
-	// C:\ProgramData\LabelAgent
-	progData := os.Getenv("ProgramData")
-	if progData == "" {
-		progData = `C:\ProgramData`
+	pd := os.Getenv("ProgramData")
+	if pd == "" {
+		pd = `C:\ProgramData`
 	}
-	return filepath.Join(progData, "LabelAgent")
+	return filepath.Join(pd, "LabelAgent")
 }
 
 func (a *app) configPath() string {
@@ -182,29 +153,21 @@ func (a *app) configPath() string {
 }
 
 func (a *app) loadConfig() error {
-	p := a.configPath()
-	b, err := os.ReadFile(p)
+	b, err := os.ReadFile(a.configPath())
 	if err != nil {
-		return nil // ok se não existe
+		return nil
 	}
-	var c Config
-	if err := json.Unmarshal(b, &c); err != nil {
-		return err
-	}
-	a.mu.Lock()
-	a.cfg = c
-	a.mu.Unlock()
-	return nil
+	return json.Unmarshal(b, &a.cfg)
 }
 
-func (a *app) saveConfig() error {
-	a.mu.RLock()
-	c := a.cfg
-	a.mu.RUnlock()
-
-	b, _ := json.MarshalIndent(c, "", "  ")
-	return os.WriteFile(a.configPath(), b, 0644)
+func (a *app) saveConfig() {
+	b, _ := json.MarshalIndent(a.cfg, "", "  ")
+	_ = os.WriteFile(a.configPath(), b, 0644)
 }
+
+/* =========================
+   HTTP + CORS
+========================= */
 
 func (a *app) startHTTP() (*http.Server, error) {
 	mux := http.NewServeMux()
@@ -213,6 +176,11 @@ func (a *app) startHTTP() (*http.Server, error) {
 	mux.HandleFunc("/printers", a.withCORS(a.handlePrinters))
 	mux.HandleFunc("/config", a.withCORS(a.handleGetConfig))
 	mux.HandleFunc("/config/printer", a.withCORS(a.handleSetPrinter))
+
+	// 🔥 NOVAS ROTAS (resolvem seu CORS)
+	mux.HandleFunc("/printer/connect", a.withCORS(a.handleConnectPrinter))
+	mux.HandleFunc("/printer/disconnect", a.withCORS(a.handleDisconnectPrinter))
+
 	mux.HandleFunc("/print", a.withCORS(a.handlePrint))
 
 	ln, err := net.Listen("tcp", listenAddr)
@@ -220,194 +188,158 @@ func (a *app) startHTTP() (*http.Server, error) {
 		return nil, err
 	}
 
-	srv := &http.Server{
-		Handler:      mux,
-		ReadTimeout:  10 * time.Second,
-		WriteTimeout: 15 * time.Second,
-		IdleTimeout:  30 * time.Second,
-	}
-
-	go func() {
-		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			a.logger.Println("http serve error:", err)
-		}
-	}()
-
+	srv := &http.Server{Handler: mux}
+	go srv.Serve(ln)
 	return srv, nil
 }
 
 func (a *app) withCORS(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		origin := r.Header.Get("Origin")
-
-		// Devolve o origin exato (melhor pra PNA do que "*")
-		if origin != "" {
+		if origin := r.Header.Get("Origin"); origin != "" {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
 			w.Header().Set("Vary", "Origin")
-		} else {
-			w.Header().Set("Access-Control-Allow-Origin", "*")
 		}
 
-		w.Header().Set("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
-
-		// ✅ MUITO IMPORTANTE: ecoar o que o browser pediu no preflight
-		if reqHeaders := r.Header.Get("Access-Control-Request-Headers"); reqHeaders != "" {
-			w.Header().Set("Access-Control-Allow-Headers", reqHeaders)
-			// pra cache de preflight não “misturar” requests diferentes
+		if h := r.Header.Get("Access-Control-Request-Headers"); h != "" {
+			w.Header().Set("Access-Control-Allow-Headers", h)
 			w.Header().Add("Vary", "Access-Control-Request-Headers")
 		} else {
 			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 		}
 
-		// ✅ Private Network Access
-		if strings.EqualFold(r.Header.Get("Access-Control-Request-Private-Network"), "true") {
+		w.Header().Set("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
+
+		if r.Header.Get("Access-Control-Request-Private-Network") == "true" {
 			w.Header().Set("Access-Control-Allow-Private-Network", "true")
 			w.Header().Add("Vary", "Access-Control-Request-Private-Network")
 		}
-
-		// Opcional: cache do preflight (10 min)
-		w.Header().Set("Access-Control-Max-Age", "600")
 
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
-
 		next(w, r)
 	}
 }
 
-func (a *app) handleHealth(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":      true,
-		"service": serviceName,
-	})
+/* =========================
+   Handlers
+========================= */
+
+func (a *app) handleHealth(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
-func (a *app) handleGetConfig(w http.ResponseWriter, r *http.Request) {
+func (a *app) handleGetConfig(w http.ResponseWriter, _ *http.Request) {
 	a.mu.RLock()
-	cfg := a.cfg
-	a.mu.RUnlock()
-	writeJSON(w, http.StatusOK, cfg)
+	defer a.mu.RUnlock()
+	writeJSON(w, http.StatusOK, a.cfg)
 }
 
 func (a *app) handleSetPrinter(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		w.WriteHeader(http.StatusMethodNotAllowed)
+	var in Config
+	if json.NewDecoder(r.Body).Decode(&in) != nil || in.PrinterName == "" {
+		writeJSON(w, 400, map[string]string{"error": "invalid printer_name"})
 		return
 	}
-	var in struct {
-		PrinterName string `json:"printer_name"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid json"})
-		return
-	}
-	in.PrinterName = strings.TrimSpace(in.PrinterName)
-	if in.PrinterName == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "printer_name is required"})
-		return
-	}
-
 	a.mu.Lock()
 	a.cfg.PrinterName = in.PrinterName
+	a.saveConfig()
 	a.mu.Unlock()
-	_ = a.saveConfig()
-
-	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":           true,
-		"printer_name": in.PrinterName,
-	})
+	writeJSON(w, 200, map[string]any{"ok": true})
 }
 
-func (a *app) handlePrinters(w http.ResponseWriter, r *http.Request) {
+func (a *app) handleConnectPrinter(w http.ResponseWriter, r *http.Request) {
+	a.handleSetPrinter(w, r)
+}
+
+func (a *app) handleDisconnectPrinter(w http.ResponseWriter, _ *http.Request) {
+	a.mu.Lock()
+	a.cfg.PrinterName = ""
+	a.saveConfig()
+	a.mu.Unlock()
+	writeJSON(w, 200, map[string]any{"connected": false})
+}
+
+func (a *app) handlePrinters(w http.ResponseWriter, _ *http.Request) {
 	printers, err := listPrintersPowerShell()
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		writeJSON(w, 500, map[string]string{"error": err.Error()})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"printers": printers})
-}
-
-func listPrintersPowerShell() ([]string, error) {
-	// Get-Printer existe no Windows 10/11 (PowerShell)
-	ps := `Get-Printer | Select-Object -ExpandProperty Name | ConvertTo-Json`
-	cmd := exec.Command("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return nil, fmt.Errorf("powershell error: %v: %s", err, string(out))
-	}
-
-	raw := strings.TrimSpace(string(out))
-	if raw == "" || raw == "null" {
-		return []string{}, nil
-	}
-
-	// ConvertTo-Json retorna string única ou array JSON
-	var one string
-	if err := json.Unmarshal([]byte(raw), &one); err == nil {
-		if strings.TrimSpace(one) == "" {
-			return []string{}, nil
-		}
-		return []string{one}, nil
-	}
-
-	var many []string
-	if err := json.Unmarshal([]byte(raw), &many); err == nil {
-		return many, nil
-	}
-
-	return nil, fmt.Errorf("could not parse printers json: %s", raw)
+	writeJSON(w, 200, map[string]any{"printers": printers})
 }
 
 func (a *app) handlePrint(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
-	}
 	var in struct {
 		PrinterName string `json:"printer_name"`
 		ZPL         string `json:"zpl"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid json"})
-		return
-	}
-	in.ZPL = strings.TrimSpace(in.ZPL)
-	if in.ZPL == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "zpl is required"})
+	if json.NewDecoder(r.Body).Decode(&in) != nil || in.ZPL == "" {
+		writeJSON(w, 400, map[string]string{"error": "invalid payload"})
 		return
 	}
 
-	// Usa printer enviada ou a salva no config
-	printer := strings.TrimSpace(in.PrinterName)
+	printer := in.PrinterName
 	if printer == "" {
-		a.mu.RLock()
-		printer = strings.TrimSpace(a.cfg.PrinterName)
-		a.mu.RUnlock()
+		printer = a.cfg.PrinterName
 	}
 	if printer == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "printer_name not set. Call POST /config/printer first."})
+		writeJSON(w, 400, map[string]string{"error": "printer not set"})
 		return
 	}
 
 	if err := printRawZPL(printer, in.ZPL); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		writeJSON(w, 500, map[string]string{"error": err.Error()})
 		return
 	}
-
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	writeJSON(w, 200, map[string]any{"ok": true})
 }
 
-func writeJSON(w http.ResponseWriter, status int, v any) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.WriteHeader(status)
+/* =========================
+   Utils
+========================= */
+
+func writeJSON(w http.ResponseWriter, s int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(s)
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-/* ============================
-   RAW printing via winspool.drv
-============================ */
+func listPrintersPowerShell() ([]string, error) {
+	ps := `Get-Printer | Select -Expand Name | ConvertTo-Json`
+	out, err := exec.Command("powershell", "-NoProfile", "-Command", ps).Output()
+	if err != nil {
+		return nil, err
+	}
+
+	var list []string
+	if json.Unmarshal(out, &list) == nil {
+		return list, nil
+	}
+
+	var one string
+	if json.Unmarshal(out, &one) == nil {
+		return []string{one}, nil
+	}
+
+	return []string{}, nil
+}
+
+/* =========================
+   RAW ZPL printing
+========================= */
+
+var (
+	winspool     = syscall.NewLazyDLL("winspool.drv")
+	openPrinter  = winspool.NewProc("OpenPrinterW")
+	closePrinter = winspool.NewProc("ClosePrinter")
+	startDoc     = winspool.NewProc("StartDocPrinterW")
+	endDoc       = winspool.NewProc("EndDocPrinter")
+	startPage    = winspool.NewProc("StartPagePrinter")
+	endPage      = winspool.NewProc("EndPagePrinter")
+	writePrinter = winspool.NewProc("WritePrinter")
+)
 
 type docInfo1 struct {
 	pDocName    *uint16
@@ -415,69 +347,30 @@ type docInfo1 struct {
 	pDatatype   *uint16
 }
 
-var (
-	modWinspool         = syscall.NewLazyDLL("winspool.drv")
-	procOpenPrinter     = modWinspool.NewProc("OpenPrinterW")
-	procClosePrinter    = modWinspool.NewProc("ClosePrinter")
-	procStartDocPrinter = modWinspool.NewProc("StartDocPrinterW")
-	procEndDocPrinter   = modWinspool.NewProc("EndDocPrinter")
-	procStartPage       = modWinspool.NewProc("StartPagePrinter")
-	procEndPage         = modWinspool.NewProc("EndPagePrinter")
-	procWritePrinter    = modWinspool.NewProc("WritePrinter")
-)
-
-func printRawZPL(printerName string, zpl string) error {
-	if printerName == "" {
-		return errors.New("printer name empty")
+func printRawZPL(printerName, zpl string) error {
+	p, _ := syscall.UTF16PtrFromString(printerName)
+	var h syscall.Handle
+	if r, _, _ := openPrinter.Call(uintptr(unsafe.Pointer(p)), uintptr(unsafe.Pointer(&h)), 0); r == 0 {
+		return errors.New("OpenPrinter failed")
 	}
+	defer closePrinter.Call(uintptr(h))
 
-	pName, err := syscall.UTF16PtrFromString(printerName)
-	if err != nil {
-		return err
+	doc, _ := syscall.UTF16PtrFromString("LabelAgent")
+	raw, _ := syscall.UTF16PtrFromString("RAW")
+
+	di := docInfo1{doc, nil, raw}
+	if startDoc.Call(uintptr(h), 1, uintptr(unsafe.Pointer(&di))) == 0 {
+		return errors.New("StartDoc failed")
 	}
+	defer endDoc.Call(uintptr(h))
 
-	var hPrinter syscall.Handle
-	r1, _, e1 := procOpenPrinter.Call(uintptr(unsafe.Pointer(pName)), uintptr(unsafe.Pointer(&hPrinter)), 0)
-	if r1 == 0 {
-		return fmt.Errorf("OpenPrinterW failed: %v", e1)
-	}
-	defer procClosePrinter.Call(uintptr(hPrinter))
+	startPage.Call(uintptr(h))
+	defer endPage.Call(uintptr(h))
 
-	docName, _ := syscall.UTF16PtrFromString("LabelAgent ZPL Job")
-	dataType, _ := syscall.UTF16PtrFromString("RAW")
-
-	di := docInfo1{
-		pDocName:    docName,
-		pOutputFile: nil,
-		pDatatype:   dataType,
-	}
-
-	jobID, _, e2 := procStartDocPrinter.Call(uintptr(hPrinter), 1, uintptr(unsafe.Pointer(&di)))
-	if jobID == 0 {
-		return fmt.Errorf("StartDocPrinterW failed: %v", e2)
-	}
-	defer procEndDocPrinter.Call(uintptr(hPrinter))
-
-	r3, _, e3 := procStartPage.Call(uintptr(hPrinter))
-	if r3 == 0 {
-		return fmt.Errorf("StartPagePrinter failed: %v", e3)
-	}
-	defer procEndPage.Call(uintptr(hPrinter))
-
-	// Zebra geralmente aceita \n normal no ZPL
-	data := []byte(zpl)
+	b := []byte(zpl)
 	var written uint32
-	r4, _, e4 := procWritePrinter.Call(
-		uintptr(hPrinter),
-		uintptr(unsafe.Pointer(&data[0])),
-		uintptr(uint32(len(data))),
-		uintptr(unsafe.Pointer(&written)),
-	)
-	if r4 == 0 {
-		return fmt.Errorf("WritePrinter failed: %v", e4)
-	}
-	if written != uint32(len(data)) {
-		return fmt.Errorf("WritePrinter wrote %d of %d bytes", written, len(data))
+	if writePrinter.Call(uintptr(h), uintptr(unsafe.Pointer(&b[0])), uintptr(len(b)), uintptr(unsafe.Pointer(&written))) == 0 {
+		return errors.New("WritePrinter failed")
 	}
 	return nil
 }
