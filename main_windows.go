@@ -92,9 +92,11 @@ func runConsole() {
 		log.Fatal(err)
 	}
 
-	log.Printf("🖨️  LabelAgent rodando no Windows em %s", listenAddr)
+	log.Printf("🖨️  LabelAgent rodando no Windows (Console Mode) em %s", listenAddr)
 	log.Printf("🌐 Aceitando conexões de: https://barbosasystem.tech")
 	log.Printf("📁 Configurações em: %s", a.cfgDir)
+	log.Printf("⚠️  Para uso em produção, instale como serviço do Windows")
+	log.Printf("💡 Execute: sc create LabelAgent binPath=\"%s\"", os.Args[0])
 
 	// Para modo console, manter vivo sem service
 	select {}
@@ -118,17 +120,24 @@ func (s *winService) Execute(args []string, r <-chan svc.ChangeRequest, status c
 	}
 
 	if s.elog != nil {
-		s.elog.Info(1, fmt.Sprintf("🖨️ LabelAgent rodando no Windows em %s", listenAddr))
+		s.elog.Info(1, fmt.Sprintf("🖨️ LabelAgent iniciado como serviço Windows em %s", listenAddr))
 		s.elog.Info(1, "🌐 Aceitando conexões de: https://barbosasystem.tech")
+		s.elog.Info(1, "🔄 Serviço configurado para inicialização automática")
 	}
 
 	status <- svc.Status{State: svc.Running, Accepts: svc.AcceptStop | svc.AcceptShutdown}
 
 	for c := range r {
 		if c.Cmd == svc.Stop || c.Cmd == svc.Shutdown {
+			if s.elog != nil {
+				s.elog.Info(1, "🛑 LabelAgent parando...")
+			}
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			_ = server.Shutdown(ctx)
 			cancel()
+			if s.elog != nil {
+				s.elog.Info(1, "✅ LabelAgent parado com sucesso")
+			}
 			status <- svc.Status{State: svc.Stopped}
 			return false, 0
 		}
@@ -269,11 +278,18 @@ func (a *app) withCORS(next http.HandlerFunc) http.HandlerFunc {
 
 func (a *app) handleHealth(w http.ResponseWriter, r *http.Request) {
 	a.logger.Printf("Health check from: %s", r.RemoteAddr)
+
+	// Verificar se está rodando como serviço
+	isService, _ := svc.IsWindowsService()
+
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":      true,
-		"service": serviceName,
-		"version": "1.0.0",
-		"address": listenAddr,
+		"ok":         true,
+		"service":    serviceName,
+		"version":    "1.0.0",
+		"address":    listenAddr,
+		"platform":   "windows",
+		"running_as": map[string]bool{"service": isService, "console": !isService},
+		"auto_start": isService,
 	})
 }
 
