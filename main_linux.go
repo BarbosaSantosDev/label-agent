@@ -1,9 +1,8 @@
-//go:build windows
+//go:build linux
 
 package main
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -15,12 +14,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"syscall"
-	"time"
-	"unsafe"
-
-	"golang.org/x/sys/windows/svc"
-	"golang.org/x/sys/windows/svc/eventlog"
 )
 
 /*
@@ -53,94 +46,30 @@ type app struct {
 }
 
 /* =========================
-   Windows service bootstrap
+   Main (Linux)
 ========================= */
 
 func main() {
-	isInt, err := svc.IsWindowsService()
-	if err != nil {
-		runConsole()
-		return
-	}
-
-	if isInt {
-		runService()
-	} else {
-		runConsole()
-	}
-}
-
-func runService() {
-	elog, err := eventlog.Open(serviceName)
-	if err != nil {
-		runConsole()
-		return
-	}
-	defer elog.Close()
-
-	a := newApp(elog)
-	elog.Info(1, "LabelAgent starting")
-
-	_ = svc.Run(serviceName, &winService{app: a, elog: elog})
-}
-
-func runConsole() {
-	a := newApp(nil)
+	a := newApp()
 
 	_, err := a.startHTTP()
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	log.Printf("🖨️  LabelAgent rodando no Windows em %s", listenAddr)
+	log.Printf("🖨️  LabelAgent rodando no Linux em %s", listenAddr)
 	log.Printf("🌐 Aceitando conexões de: https://barbosasystem.tech")
 	log.Printf("📁 Configurações em: %s", a.cfgDir)
 
-	// Para modo console, manter vivo sem service
+	// mantém o processo vivo
 	select {}
-}
-
-type winService struct {
-	app  *app
-	elog *eventlog.Log
-}
-
-func (s *winService) Execute(args []string, r <-chan svc.ChangeRequest, status chan<- svc.Status) (bool, uint32) {
-	status <- svc.Status{State: svc.StartPending}
-
-	server, err := s.app.startHTTP()
-	if err != nil {
-		if s.elog != nil {
-			s.elog.Error(1, fmt.Sprintf("Erro ao iniciar HTTP: %v", err))
-		}
-		status <- svc.Status{State: svc.Stopped}
-		return false, 1
-	}
-
-	if s.elog != nil {
-		s.elog.Info(1, fmt.Sprintf("🖨️ LabelAgent rodando no Windows em %s", listenAddr))
-		s.elog.Info(1, "🌐 Aceitando conexões de: https://barbosasystem.tech")
-	}
-
-	status <- svc.Status{State: svc.Running, Accepts: svc.AcceptStop | svc.AcceptShutdown}
-
-	for c := range r {
-		if c.Cmd == svc.Stop || c.Cmd == svc.Shutdown {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			_ = server.Shutdown(ctx)
-			cancel()
-			status <- svc.Status{State: svc.Stopped}
-			return false, 0
-		}
-	}
-	return false, 0
 }
 
 /* =========================
    App / Config
 ========================= */
 
-func newApp(elog *eventlog.Log) *app {
+func newApp() *app {
 	cfgDir := defaultConfigDir()
 	_ = os.MkdirAll(cfgDir, 0755)
 
@@ -162,11 +91,8 @@ func newApp(elog *eventlog.Log) *app {
 }
 
 func defaultConfigDir() string {
-	pd := os.Getenv("ProgramData")
-	if pd == "" {
-		pd = `C:\ProgramData`
-	}
-	return filepath.Join(pd, "LabelAgent")
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".label-agent")
 }
 
 func (a *app) configPath() string {
@@ -197,11 +123,8 @@ func (a *app) startHTTP() (*http.Server, error) {
 	mux.HandleFunc("/printers", a.withCORS(a.handlePrinters))
 	mux.HandleFunc("/config", a.withCORS(a.handleGetConfig))
 	mux.HandleFunc("/config/printer", a.withCORS(a.handleSetPrinter))
-
-	// 🔥 NOVAS ROTAS (resolvem seu CORS)
 	mux.HandleFunc("/printer/connect", a.withCORS(a.handleConnectPrinter))
 	mux.HandleFunc("/printer/disconnect", a.withCORS(a.handleDisconnectPrinter))
-
 	mux.HandleFunc("/print", a.withCORS(a.handlePrint))
 
 	ln, err := net.Listen("tcp", listenAddr)
@@ -250,11 +173,6 @@ func (a *app) withCORS(next http.HandlerFunc) http.HandlerFunc {
 		w.Header().Set("Access-Control-Allow-Methods", "GET,POST,OPTIONS,PUT,DELETE")
 		w.Header().Set("Access-Control-Allow-Credentials", "true")
 
-		if r.Header.Get("Access-Control-Request-Private-Network") == "true" {
-			w.Header().Set("Access-Control-Allow-Private-Network", "true")
-			w.Header().Add("Vary", "Access-Control-Request-Private-Network")
-		}
-
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -289,10 +207,12 @@ func (a *app) handleSetPrinter(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]string{"error": "invalid printer_name"})
 		return
 	}
+
 	a.mu.Lock()
 	a.cfg.PrinterName = in.PrinterName
 	a.saveConfig()
 	a.mu.Unlock()
+
 	writeJSON(w, 200, map[string]any{"ok": true})
 }
 
@@ -305,11 +225,12 @@ func (a *app) handleDisconnectPrinter(w http.ResponseWriter, _ *http.Request) {
 	a.cfg.PrinterName = ""
 	a.saveConfig()
 	a.mu.Unlock()
+
 	writeJSON(w, 200, map[string]any{"connected": false})
 }
 
 func (a *app) handlePrinters(w http.ResponseWriter, _ *http.Request) {
-	printers, err := listPrintersPowerShell()
+	printers, err := listPrintersCUPS()
 	if err != nil {
 		writeJSON(w, 500, map[string]string{"error": err.Error()})
 		return
@@ -412,75 +333,38 @@ func writeJSON(w http.ResponseWriter, s int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-func listPrintersPowerShell() ([]string, error) {
-	ps := `Get-Printer | Select -Expand Name | ConvertTo-Json`
-	out, err := exec.Command("powershell", "-NoProfile", "-Command", ps).Output()
+/* =========================
+   CUPS
+========================= */
+
+func listPrintersCUPS() ([]string, error) {
+	out, err := exec.Command("lpstat", "-p").Output()
 	if err != nil {
 		return nil, err
 	}
 
-	var list []string
-	if json.Unmarshal(out, &list) == nil {
-		return list, nil
+	lines := strings.Split(string(out), "\n")
+	var printers []string
+
+	for _, l := range lines {
+		if strings.HasPrefix(l, "printer ") {
+			parts := strings.Fields(l)
+			if len(parts) >= 2 {
+				printers = append(printers, parts[1])
+			}
+		}
 	}
 
-	var one string
-	if json.Unmarshal(out, &one) == nil {
-		return []string{one}, nil
-	}
-
-	return []string{}, nil
-}
-
-/* =========================
-   RAW ZPL printing
-========================= */
-
-var (
-	winspool     = syscall.NewLazyDLL("winspool.drv")
-	openPrinter  = winspool.NewProc("OpenPrinterW")
-	closePrinter = winspool.NewProc("ClosePrinter")
-	startDoc     = winspool.NewProc("StartDocPrinterW")
-	endDoc       = winspool.NewProc("EndDocPrinter")
-	startPage    = winspool.NewProc("StartPagePrinter")
-	endPage      = winspool.NewProc("EndPagePrinter")
-	writePrinter = winspool.NewProc("WritePrinter")
-)
-
-type docInfo1 struct {
-	pDocName    *uint16
-	pOutputFile *uint16
-	pDatatype   *uint16
+	return printers, nil
 }
 
 func printRawZPL(printerName, zpl string) error {
-	p, _ := syscall.UTF16PtrFromString(printerName)
-	var h syscall.Handle
-	r1, _, err := openPrinter.Call(uintptr(unsafe.Pointer(p)), uintptr(unsafe.Pointer(&h)), 0)
-	if r1 == 0 {
-		return fmt.Errorf("OpenPrinter failed: %v", err)
+	cmd := exec.Command("lp", "-d", printerName, "-o", "raw")
+	cmd.Stdin = strings.NewReader(zpl)
+
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("lp failed: %v | %s", err, string(out))
 	}
-	defer closePrinter.Call(uintptr(h))
-
-	doc, _ := syscall.UTF16PtrFromString("LabelAgent")
-	raw, _ := syscall.UTF16PtrFromString("RAW")
-	di := docInfo1{doc, nil, raw}
-
-	r1, _, err = startDoc.Call(uintptr(h), 1, uintptr(unsafe.Pointer(&di)))
-	if r1 == 0 {
-		return fmt.Errorf("StartDocPrinter failed: %v", err)
-	}
-	defer endDoc.Call(uintptr(h))
-
-	startPage.Call(uintptr(h))
-	defer endPage.Call(uintptr(h))
-
-	b := []byte(zpl)
-	var written uint32
-	r1, _, err = writePrinter.Call(uintptr(h), uintptr(unsafe.Pointer(&b[0])), uintptr(len(b)), uintptr(unsafe.Pointer(&written)))
-	if r1 == 0 {
-		return fmt.Errorf("WritePrinter failed: %v", err)
-	}
-
 	return nil
 }
