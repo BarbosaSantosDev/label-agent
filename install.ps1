@@ -11,6 +11,7 @@ param(
 $ServiceName = "LabelAgent"
 $DisplayName = "Industrial Labels Printer Agent"
 $ExeFileName = "label-agent.exe"
+$InstallDir = Join-Path $env:ProgramFiles "LabelAgent"
 
 # Cores
 function Write-Success { param($msg) Write-Host "✅ $msg" -ForegroundColor Green }
@@ -90,15 +91,15 @@ function Install-ServiceAgent {
     Write-Info "🔧 Instalando LabelAgent como serviço..."
 
     # Verificar se executável existe
-    $exePath = Join-Path $PSScriptRoot $ExeFileName
-    if (-not (Test-Path $exePath)) {
+    $sourceExe = Join-Path $PSScriptRoot $ExeFileName
+    if (-not (Test-Path $sourceExe)) {
         Write-Error "Arquivo $ExeFileName não encontrado!"
         Write-Info "Certifique-se de que o arquivo está na pasta: $PSScriptRoot"
         return $false
     }
     Write-Success "Executável encontrado: $ExeFileName"
 
-    # Remover serviço existente se houver
+    # Remover serviço existente se houver (também é o caminho de atualização)
     $status = Get-ServiceStatus
     if ($status.Exists) {
         Write-Info "Removendo instalação anterior..."
@@ -109,6 +110,12 @@ function Install-ServiceAgent {
         sc.exe delete $ServiceName | Out-Null
         Start-Sleep 2
     }
+
+    # Copiar para Program Files para o serviço não depender da pasta extraída
+    New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
+    $exePath = Join-Path $InstallDir $ExeFileName
+    Copy-Item $sourceExe $exePath -Force
+    Write-Success "Executável copiado para: $InstallDir"
 
     # Criar serviço
     Write-Info "Criando serviço Windows..."
@@ -172,6 +179,11 @@ function Uninstall-ServiceAgent {
     if ($LASTEXITCODE -eq 0) {
         Write-Success "Serviço removido com sucesso"
 
+        Start-Sleep 2
+        if (Test-Path $InstallDir) {
+            Remove-Item $InstallDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+
         # Remover regra do firewall
         try {
             Remove-NetFirewallRule -DisplayName "LabelAgent-7777" -ErrorAction SilentlyContinue | Out-Null
@@ -219,7 +231,7 @@ function Show-PostInstall {
     Write-Host "✅ Firewall configurado" -ForegroundColor Green
     Write-Host ""
     Write-Host "🌐 PRÓXIMOS PASSOS:" -ForegroundColor Cyan
-    Write-Host "1. Acesse: https://barbosasystem.tech"
+    Write-Host "1. Acesse: https://label.barbosasystem.tech"
     Write-Host "2. Faça login no sistema"
     Write-Host "3. Configure sua impressora"
     Write-Host "4. Teste criando etiquetas"
@@ -274,27 +286,11 @@ function Main {
         return
     }
 
-    # Instalação padrão
+    # Instalação padrão (instala ou atualiza, sem perguntas)
     Write-Info "Verificando sistema..."
-
-    # Verificar se já está instalado
-    $status = Get-ServiceStatus
-    if ($status.Exists -and $status.Status -eq "Running") {
-        Write-Success "LabelAgent já está instalado e rodando!"
-        Show-ServiceStatus
-        Read-Host "Pressione Enter para continuar"
-        return
-    }
 
     # Mostrar impressoras disponíveis
     Show-PrinterList
-
-    # Confirmar instalação
-    $response = Read-Host "Instalar LabelAgent como serviço do Windows? (Y/n)"
-    if ($response -eq "n" -or $response -eq "N") {
-        Write-Info "Instalação cancelada"
-        return
-    }
 
     # Executar instalação
     if (Install-ServiceAgent) {
@@ -302,9 +298,8 @@ function Main {
     } else {
         Write-Error "Instalação falhou!"
         Write-Info "Verifique os logs do Event Viewer para mais detalhes"
+        exit 1
     }
-
-    Read-Host "Pressione Enter para continuar"
 }
 
 # EXECUTAR
@@ -312,5 +307,5 @@ try {
     Main
 } catch {
     Write-Error "Erro durante execução: $($_.Exception.Message)"
-    Read-Host "Pressione Enter para continuar"
+    exit 1
 }

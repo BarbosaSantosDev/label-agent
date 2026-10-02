@@ -41,6 +41,9 @@ const (
 	DEFAULT_COPIES = 1              // Valor padrão
 )
 
+// version é definida no build via -ldflags "-X main.version=..."
+var version = "dev"
+
 type Config struct {
 	PrinterName string `json:"printer_name"`
 }
@@ -93,7 +96,7 @@ func runConsole() {
 	}
 
 	log.Printf("🖨️  LabelAgent rodando no Windows (Console Mode) em %s", listenAddr)
-	log.Printf("🌐 Aceitando conexões de: https://barbosasystem.tech")
+	log.Printf("🌐 Aceitando conexões de: https://label.barbosasystem.tech")
 	log.Printf("📁 Configurações em: %s", a.cfgDir)
 	log.Printf("⚠️  Para uso em produção, instale como serviço do Windows")
 	log.Printf("💡 Execute: sc create LabelAgent binPath=\"%s\"", os.Args[0])
@@ -121,7 +124,7 @@ func (s *winService) Execute(args []string, r <-chan svc.ChangeRequest, status c
 
 	if s.elog != nil {
 		s.elog.Info(1, fmt.Sprintf("🖨️ LabelAgent iniciado como serviço Windows em %s", listenAddr))
-		s.elog.Info(1, "🌐 Aceitando conexões de: https://barbosasystem.tech")
+		s.elog.Info(1, "🌐 Aceitando conexões de: https://label.barbosasystem.tech")
 		s.elog.Info(1, "🔄 Serviço configurado para inicialização automática")
 	}
 
@@ -231,6 +234,7 @@ func (a *app) withCORS(next http.HandlerFunc) http.HandlerFunc {
 		allowedOrigins := []string{
 			"https://barbosasystem.tech",
 			"https://www.barbosasystem.tech",
+			"https://label.barbosasystem.tech",
 			"http://localhost:8080",
 			"http://localhost:3000",
 		}
@@ -285,7 +289,7 @@ func (a *app) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":         true,
 		"service":    serviceName,
-		"version":    "1.0.0",
+		"version":    version,
 		"address":    listenAddr,
 		"platform":   "windows",
 		"running_as": map[string]bool{"service": isService, "console": !isService},

@@ -4,6 +4,9 @@
 
 title LabelAgent - Instalador
 
+:: "Executar como administrador" abre em C:\Windows\System32; volta para a pasta do instalador
+cd /d "%~dp0"
+
 echo.
 echo ========================================
 echo  LabelAgent - Sistema Industrial Labels
@@ -53,7 +56,7 @@ if %errorLevel% == 0 (
     echo O LabelAgent agora esta rodando como servico do Windows
     echo e iniciara automaticamente quando ligar o computador.
     echo.
-    echo Acesse: https://barbosasystem.tech
+    echo Acesse: https://label.barbosasystem.tech
     echo.
 ) else (
     echo.
